@@ -57,6 +57,7 @@ from .helpers.typing import UNDEFINED, ConfigType, DiscoveryInfoType, UndefinedT
 from .loader import async_suggest_report_issue
 from .setup import DATA_SETUP_DONE, async_process_deps_reqs, async_setup_component
 from .util import uuid as uuid_util
+from .util.async_ import create_eager_task
 from .util.decorator import Registry
 
 if TYPE_CHECKING:
@@ -78,6 +79,7 @@ _LOGGER = logging.getLogger(__name__)
 SOURCE_BLUETOOTH = "bluetooth"
 SOURCE_DHCP = "dhcp"
 SOURCE_DISCOVERY = "discovery"
+SOURCE_HARDWARE = "hardware"
 SOURCE_HASSIO = "hassio"
 SOURCE_HOMEKIT = "homekit"
 SOURCE_IMPORT = "import"
@@ -162,6 +164,7 @@ DISCOVERY_SOURCES = {
     SOURCE_BLUETOOTH,
     SOURCE_DHCP,
     SOURCE_DISCOVERY,
+    SOURCE_HARDWARE,
     SOURCE_HOMEKIT,
     SOURCE_IMPORT,
     SOURCE_INTEGRATION_DISCOVERY,
@@ -487,7 +490,7 @@ class ConfigEntry:
 
         if domain_is_integration:
             try:
-                integration.get_platform("config_flow")
+                await integration.async_get_platform("config_flow")
             except ImportError as err:
                 _LOGGER.error(
                     (
@@ -906,6 +909,7 @@ class ConfigEntry:
             issue_domain=self.domain,
             severity=ir.IssueSeverity.ERROR,
             translation_key="config_entry_reauth",
+            translation_placeholders={"name": self.title},
         )
 
     @callback
@@ -972,6 +976,7 @@ class ConfigEntry:
         hass: HomeAssistant,
         target: Coroutine[Any, Any, _R],
         name: str | None = None,
+        eager_start: bool = False,
     ) -> asyncio.Task[_R]:
         """Create a task from within the event loop.
 
@@ -980,7 +985,7 @@ class ConfigEntry:
         target: target to call.
         """
         task = hass.async_create_task(
-            target, f"{name} {self.title} {self.domain} {self.entry_id}"
+            target, f"{name} {self.title} {self.domain} {self.entry_id}", eager_start
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.remove)
@@ -989,7 +994,11 @@ class ConfigEntry:
 
     @callback
     def async_create_background_task(
-        self, hass: HomeAssistant, target: Coroutine[Any, Any, _R], name: str
+        self,
+        hass: HomeAssistant,
+        target: Coroutine[Any, Any, _R],
+        name: str,
+        eager_start: bool = False,
     ) -> asyncio.Task[_R]:
         """Create a background task tied to the config entry lifecycle.
 
@@ -997,7 +1006,7 @@ class ConfigEntry:
 
         target: target to call.
         """
-        task = hass.async_create_background_task(target, name)
+        task = hass.async_create_background_task(target, name, eager_start)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.remove)
         return task
@@ -1057,6 +1066,19 @@ class ConfigEntriesFlowManager(data_entry_flow.FlowManager):
         if not context or "source" not in context:
             raise KeyError("Context not set or doesn't have a source set")
 
+        # Avoid starting a config flow on an integration that only supports
+        # a single config entry, but which already has an entry
+        if (
+            context.get("source") != SOURCE_REAUTH
+            and await _support_single_config_entry_only(self.hass, handler)
+            and self.config_entries.async_has_entry(handler)
+        ):
+            raise HomeAssistantError(
+                "Cannot start a config flow, the integration"
+                " supports only a single config entry"
+                " but already has one"
+            )
+
         flow_id = uuid_util.random_uuid_hex()
         loop = self.hass.loop
 
@@ -1110,12 +1132,13 @@ class ConfigEntriesFlowManager(data_entry_flow.FlowManager):
                 init_done.set_result(None)
         return flow, result
 
-    async def async_shutdown(self) -> None:
+    @callback
+    def async_shutdown(self) -> None:
         """Cancel any initializing flows."""
         for future_list in self._initialize_futures.values():
             for future in future_list:
                 future.set_result(None)
-        await self._discovery_debouncer.async_shutdown()
+        self._discovery_debouncer.async_shutdown()
 
     async def async_finish_flow(
         self, flow: data_entry_flow.FlowHandler, result: data_entry_flow.FlowResult
@@ -1153,11 +1176,21 @@ class ConfigEntriesFlowManager(data_entry_flow.FlowManager):
         # or the default discovery ID
         for progress_flow in self.async_progress_by_handler(flow.handler):
             progress_unique_id = progress_flow["context"].get("unique_id")
-            if progress_flow["flow_id"] != flow.flow_id and (
+            progress_flow_id = progress_flow["flow_id"]
+
+            if progress_flow_id != flow.flow_id and (
                 (flow.unique_id and progress_unique_id == flow.unique_id)
                 or progress_unique_id == DEFAULT_DISCOVERY_UNIQUE_ID
             ):
-                self.async_abort(progress_flow["flow_id"])
+                self.async_abort(progress_flow_id)
+
+            # Abort any flows in progress for the same handler
+            # when integration allows only one config entry
+            if (
+                progress_flow_id != flow.flow_id
+                and await _support_single_config_entry_only(self.hass, flow.handler)
+            ):
+                self.async_abort(progress_flow_id)
 
         if flow.unique_id is not None:
             # Reset unique ID when the default discovery ID has been used
@@ -1416,12 +1449,28 @@ class ConfigEntries:
         """Return entry for a domain with a matching unique id."""
         return self._entries.get_entry_by_domain_and_unique_id(domain, unique_id)
 
+    @callback
+    def async_has_entry(self, domain: str) -> bool:
+        """Return if there are entries for a domain."""
+        return bool(self.async_entries(domain))
+
     async def async_add(self, entry: ConfigEntry) -> None:
         """Add and setup an entry."""
         if entry.entry_id in self._entries.data:
             raise HomeAssistantError(
                 f"An entry with the id {entry.entry_id} already exists."
             )
+
+        # Avoid adding a config entry for a integration
+        # that only supports a single config entry, but already has an entry
+        if await _support_single_config_entry_only(
+            self.hass, entry.domain
+        ) and self.async_has_entry(entry.domain):
+            raise HomeAssistantError(
+                f"An entry for {entry.domain} already exists,"
+                f" but integration supports only one config entry"
+            )
+
         self._entries[entry.entry_id] = entry
         self._async_dispatch(ConfigEntryChange.ADDED, entry)
         await self.async_setup(entry.entry_id)
@@ -1476,11 +1525,12 @@ class ConfigEntries:
         self._async_dispatch(ConfigEntryChange.REMOVED, entry)
         return {"require_restart": not unload_success}
 
-    async def _async_shutdown(self, event: Event) -> None:
+    @callback
+    def _async_shutdown(self, event: Event) -> None:
         """Call when Home Assistant is stopping."""
         for entry in self._entries.values():
             entry.async_shutdown()
-        await self.flow.async_shutdown()
+        self.flow.async_shutdown()
 
     async def async_initialize(self) -> None:
         """Initialize config entry config."""
@@ -1738,7 +1788,7 @@ class ConfigEntries:
         """Forward the setup of an entry to platforms."""
         await asyncio.gather(
             *(
-                asyncio.create_task(
+                create_eager_task(
                     self.async_forward_entry_setup(entry, platform),
                     name=f"config entry forward setup {entry.title} {entry.domain} {entry.entry_id} {platform}",
                 )
@@ -1774,7 +1824,7 @@ class ConfigEntries:
         return all(
             await asyncio.gather(
                 *(
-                    asyncio.create_task(
+                    create_eager_task(
                         self.async_forward_entry_unload(entry, platform),
                         name=f"config entry forward unload {entry.title} {entry.domain} {entry.entry_id} {platform}",
                     )
@@ -2425,6 +2475,12 @@ async def support_entry_reconfigure(hass: HomeAssistant, domain: str) -> bool:
     return bool(handler and hasattr(handler, "async_step_reconfigure"))
 
 
+async def _support_single_config_entry_only(hass: HomeAssistant, domain: str) -> bool:
+    """Test if a domain supports only a single config entry."""
+    integration = await loader.async_get_integration(hass, domain)
+    return integration.single_config_entry
+
+
 async def _load_integration(
     hass: HomeAssistant, domain: str, hass_config: ConfigType
 ) -> None:
@@ -2436,9 +2492,8 @@ async def _load_integration(
 
     # Make sure requirements and dependencies of component are resolved
     await async_process_deps_reqs(hass, hass_config, integration)
-
     try:
-        integration.get_platform("config_flow")
+        await integration.async_get_platform("config_flow")
     except ImportError as err:
         _LOGGER.error(
             "Error occurred loading flow for integration %s: %s",
